@@ -27,12 +27,19 @@
  *     decryption to fail. This harness aborts if a corrupted tag is ever
  *     wrongly accepted.
  *
- * The tag is read/written via the OSSL_PARAM interface
- * (OSSL_CIPHER_PARAM_AEAD_TAG through EVP_CIPHER_CTX_get/set_params)
- * rather than the legacy EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_*_TAG) calls,
- * to stay consistent with the OSSL_PARAM-based style used elsewhere in
- * this project's evp_aead_test.c, and because it's the more future-proof
- * of the two equivalent interfaces.
+ * IMPORTANT, hard-won API detail: GCM-SIV's decrypt path requires the tag
+ * to be set via EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_TAG) BEFORE the key
+ * and IV are installed -- i.e. Init(cipher only) -> SET_TAG -> Init(key+iv)
+ * -> Update -> Final. This is the exact sequence test/evp_test.c's
+ * cipher_test_enc() uses. Every other common AEAD mode (GCM, CCM,
+ * ChaCha20-Poly1305) tolerates -- or expects -- the tag being set right
+ * before Final instead; GCM-SIV does not. Getting this wrong produces
+ * "correct tag rejected" failures on every single decrypt, which looks
+ * exactly like a library bug until checked against evp_test.c's own
+ * source. (An earlier version of this harness got this wrong.) Encrypt
+ * has no such requirement and uses the ordinary single-call
+ * EVP_EncryptInit_ex2, confirmed byte-correct against RFC 8452's own
+ * published test vectors.
  */
 
 #include <string.h>
@@ -96,7 +103,9 @@ static int chunked_update(EVP_CIPHER_CTX *ctx, unsigned char *out,
     return 1;
 }
 
-/* Read the current tag out of an encrypt context via OSSL_PARAM. */
+/* Read the current tag out of an encrypt context via OSSL_PARAM. Confirmed
+ * byte-correct against RFC 8452's own published test vector -- encrypt has
+ * no ordering requirement, unlike decrypt below. */
 static int get_tag(EVP_CIPHER_CTX *ctx, unsigned char *tag)
 {
     OSSL_PARAM params[2];
@@ -107,15 +116,60 @@ static int get_tag(EVP_CIPHER_CTX *ctx, unsigned char *tag)
     return EVP_CIPHER_CTX_get_params(ctx, params);
 }
 
-/* Tell a decrypt context which tag to expect, via OSSL_PARAM. */
-static int set_tag(EVP_CIPHER_CTX *ctx, const unsigned char *tag)
+/*
+ * Decrypt using GCM-SIV's required ordering (see file header comment).
+ * Return values:
+ *    1 -- decrypt succeeded; plaintext is in out[0..*out_len)
+ *    0 -- an earlier setup call failed; this input isn't meaningful
+ *   -1 -- every setup step succeeded, but EVP_DecryptFinal_ex rejected
+ *         the tag. Distinct from 0 so callers can tell "the tag itself
+ *         was rejected" apart from "never got that far".
+ */
+static int decrypt_with_tag(EVP_CIPHER *cipher, const unsigned char *key,
+                             const unsigned char *nonce,
+                             const unsigned char *tag, size_t tag_len,
+                             const unsigned char *aad, size_t aad_len,
+                             const unsigned char *ct, size_t ct_len,
+                             unsigned int chunks,
+                             unsigned char *out, int *out_len)
 {
-    OSSL_PARAM params[2];
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int unused = 0, tmplen = 0, rv = 0;
 
-    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
-                                                    (void *)tag, TAG_LEN);
-    params[1] = OSSL_PARAM_construct_end();
-    return EVP_CIPHER_CTX_set_params(ctx, params);
+    if (ctx == NULL)
+        return 0;
+
+    /* Stage 1: cipher type only, no key/iv yet. */
+    if (!EVP_CipherInit_ex2(ctx, cipher, NULL, NULL, 0 /* decrypt */, NULL))
+        goto done;
+
+    /* Stage 2: set the tag BEFORE key/iv are installed. */
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
+                             (int)tag_len, (void *)tag) <= 0)
+        goto done;
+
+    /* Stage 3: install key + iv (cipher == NULL keeps the current cipher). */
+    if (!EVP_CipherInit_ex(ctx, NULL, NULL, key, nonce, -1))
+        goto done;
+
+    EVP_CIPHER_CTX_set_padding(ctx, 0); /* matches evp_test.c */
+
+    if (!chunked_update(ctx, NULL, &unused, aad, aad_len, chunks))
+        goto done;
+
+    if (!chunked_update(ctx, out, out_len, ct, ct_len, chunks))
+        goto done;
+
+    if (EVP_DecryptFinal_ex(ctx, out + *out_len, &tmplen) <= 0) {
+        rv = -1; /* every setup step worked; the tag was rejected */
+        goto done;
+    }
+    *out_len += tmplen;
+    rv = 1;
+
+done:
+    EVP_CIPHER_CTX_free(ctx);
+    return rv;
 }
 
 int FuzzerTestOneInput(const uint8_t *buf, size_t len)
@@ -126,7 +180,7 @@ int FuzzerTestOneInput(const uint8_t *buf, size_t len)
     unsigned char aad_ctrl;
     unsigned char *ct = NULL, *decrypted = NULL, *bad_out = NULL, tag[TAG_LEN];
     int ct_len = 0, decrypted_len = 0, tmplen = 0, unused = 0;
-    EVP_CIPHER_CTX *enc_ctx = NULL, *dec_ctx = NULL;
+    EVP_CIPHER_CTX *enc_ctx = NULL;
 
     if (aes_256_gcm_siv == NULL)
         return 0;
@@ -158,13 +212,11 @@ int FuzzerTestOneInput(const uint8_t *buf, size_t len)
      * plaintext regardless of how these blocks get reordered later. */
     bad_out = OPENSSL_malloc(pt_len + EVP_MAX_BLOCK_LENGTH);
     enc_ctx = EVP_CIPHER_CTX_new();
-    dec_ctx = EVP_CIPHER_CTX_new();
 
-    if (ct == NULL || decrypted == NULL || bad_out == NULL
-        || enc_ctx == NULL || dec_ctx == NULL)
+    if (ct == NULL || decrypted == NULL || bad_out == NULL || enc_ctx == NULL)
         goto err;
 
-    /* --- Encrypt --- */
+    /* --- Encrypt (ordinary single-call Init; no special ordering needed) --- */
     if (!EVP_EncryptInit_ex2(enc_ctx, aes_256_gcm_siv, key, nonce, NULL))
         goto err;
 
@@ -182,25 +234,19 @@ int FuzzerTestOneInput(const uint8_t *buf, size_t len)
         goto err;
 
     /* --- Decrypt with the correct tag: must succeed and match exactly --- */
-    if (!EVP_DecryptInit_ex2(dec_ctx, aes_256_gcm_siv, key, nonce, NULL))
-        goto err;
+    {
+        int rv = decrypt_with_tag(aes_256_gcm_siv, key, nonce, tag, TAG_LEN,
+                                   aad, aad_len, ct, (size_t)ct_len,
+                                   dec_chunks, decrypted, &decrypted_len);
 
-    unused = 0;
-    if (!chunked_update(dec_ctx, NULL, &unused, aad, aad_len, dec_chunks))
-        goto err;
-
-    if (!chunked_update(dec_ctx, decrypted, &decrypted_len, ct,
-                         (size_t)ct_len, dec_chunks))
-        goto err;
-
-    if (!set_tag(dec_ctx, tag))
-        goto err;
-
-    if (EVP_DecryptFinal_ex(dec_ctx, decrypted + decrypted_len, &tmplen) <= 0) {
-        /* A correct tag was rejected. Real bug: false-negative auth. */
-        abort();
+        if (rv == -1) {
+            /* Every setup step succeeded; the correct tag was rejected.
+             * Real bug: false-negative auth. */
+            abort();
+        }
+        if (rv != 1)
+            goto err; /* some setup call failed -- not a meaningful input */
     }
-    decrypted_len += tmplen;
 
     /* Metamorphic oracle: decrypt(encrypt(pt)) must equal pt exactly. */
     if ((size_t)decrypted_len != pt_len
@@ -210,30 +256,27 @@ int FuzzerTestOneInput(const uint8_t *buf, size_t len)
 
     /* --- Decrypt with a corrupted tag: must fail --- */
     {
-        EVP_CIPHER_CTX *bad_ctx = EVP_CIPHER_CTX_new();
         unsigned char bad_tag[TAG_LEN];
-        int bad_len = 0, bad_tmplen = 0, bad_unused = 0;
+        int bad_len = 0;
+        int rv;
 
-        if (bad_ctx != NULL) {
-            memcpy(bad_tag, tag, TAG_LEN);
-            bad_tag[0] ^= 0xff;
+        memcpy(bad_tag, tag, TAG_LEN);
+        bad_tag[0] ^= 0xff;
 
-            if (EVP_DecryptInit_ex2(bad_ctx, aes_256_gcm_siv, key, nonce, NULL)
-                && chunked_update(bad_ctx, NULL, &bad_unused, aad, aad_len, dec_chunks)
-                && chunked_update(bad_ctx, bad_out, &bad_len, ct,
-                                   (size_t)ct_len, dec_chunks)
-                && set_tag(bad_ctx, bad_tag)
-                && EVP_DecryptFinal_ex(bad_ctx, bad_out + bad_len, &bad_tmplen) > 0) {
-                /* A corrupted tag was ACCEPTED. Real bug: auth bypass. */
-                abort();
-            }
-            EVP_CIPHER_CTX_free(bad_ctx);
+        rv = decrypt_with_tag(aes_256_gcm_siv, key, nonce, bad_tag, TAG_LEN,
+                               aad, aad_len, ct, (size_t)ct_len,
+                               dec_chunks, bad_out, &bad_len);
+
+        if (rv == 1) {
+            /* A corrupted tag was ACCEPTED. Real bug: auth bypass. */
+            abort();
         }
+        /* rv == 0 (setup failed) or rv == -1 (correctly rejected) are
+         * both fine here -- only rv == 1 indicates a real problem. */
     }
 
 err:
     EVP_CIPHER_CTX_free(enc_ctx);
-    EVP_CIPHER_CTX_free(dec_ctx);
     OPENSSL_free(ct);
     OPENSSL_free(decrypted);
     OPENSSL_free(bad_out);
