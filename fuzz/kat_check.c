@@ -72,8 +72,12 @@ int main(void)
         return 1;
     }
 
-    if (!EVP_EncryptInit_ex2(enc, cipher, key, iv, NULL)
-        || !EVP_EncryptUpdate(enc, ct, &ct_len, pt, sizeof(pt))
+    if (!EVP_EncryptInit_ex2(enc, cipher, key, iv, NULL)) {
+        printf("ENCRYPT INIT FAILED\n");
+        return 1;
+    }
+    EVP_CIPHER_CTX_set_padding(enc, 0); /* matches evp_test.c's unconditional call */
+    if (!EVP_EncryptUpdate(enc, ct, &ct_len, pt, sizeof(pt))
         || !EVP_EncryptFinal_ex(enc, ct + ct_len, &tmplen)) {
         printf("ENCRYPT CALL FAILED (not even a wrong-answer -- a hard failure)\n");
         return 1;
@@ -106,7 +110,7 @@ int main(void)
     {
         EVP_CIPHER_CTX *d = EVP_CIPHER_CTX_new();
         unsigned char out[32];
-        int ol = 0, tl = 0;
+        int ol = 0, tl = 0, init_ok = 0;
         OSSL_PARAM s[2];
         unsigned char tag_copy[16];
 
@@ -115,8 +119,13 @@ int main(void)
                                                   tag_copy, 16);
         s[1] = OSSL_PARAM_construct_end();
 
-        if (d != NULL
-            && EVP_DecryptInit_ex2(d, cipher, key, iv, NULL)
+        if (d != NULL) {
+            init_ok = EVP_DecryptInit_ex2(d, cipher, key, iv, NULL);
+            if (init_ok)
+                EVP_CIPHER_CTX_set_padding(d, 0); /* matches evp_test.c */
+        }
+
+        if (init_ok
             && EVP_DecryptUpdate(d, out, &ol, expected_ct, sizeof(expected_ct))
             && EVP_CIPHER_CTX_set_params(d, s)
             && EVP_DecryptFinal_ex(d, out + ol, &tl) > 0) {
@@ -142,18 +151,31 @@ int main(void)
             EVP_CIPHER_CTX *e = EVP_CIPHER_CTX_new();
             EVP_CIPHER_CTX *d = EVP_CIPHER_CTX_new();
             unsigned char c[128], out[128], t[16];
-            int cl = 0, ol = 0, tl = 0;
+            int cl = 0, ol = 0, tl = 0, enc_init_ok = 0, dec_init_ok = 0;
             OSSL_PARAM g[2], s[2];
             int pass = 0;
 
-            if (EVP_EncryptInit_ex2(e, cipher, key, iv, NULL)
+            if (e != NULL) {
+                enc_init_ok = EVP_EncryptInit_ex2(e, cipher, key, iv, NULL);
+                if (enc_init_ok)
+                    EVP_CIPHER_CTX_set_padding(e, 0); /* matches evp_test.c */
+            }
+
+            if (enc_init_ok
                 && EVP_EncryptUpdate(e, c, &cl, buf, (int)lens[i])
                 && EVP_EncryptFinal_ex(e, c + cl, &tl)) {
                 cl += tl;
                 g[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG, t, 16);
                 g[1] = OSSL_PARAM_construct_end();
+
+                if (d != NULL) {
+                    dec_init_ok = EVP_DecryptInit_ex2(d, cipher, key, iv, NULL);
+                    if (dec_init_ok)
+                        EVP_CIPHER_CTX_set_padding(d, 0); /* matches evp_test.c */
+                }
+
                 if (EVP_CIPHER_CTX_get_params(e, g)
-                    && EVP_DecryptInit_ex2(d, cipher, key, iv, NULL)
+                    && dec_init_ok
                     && EVP_DecryptUpdate(d, out, &ol, c, cl)) {
                     s[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG, t, 16);
                     s[1] = OSSL_PARAM_construct_end();
