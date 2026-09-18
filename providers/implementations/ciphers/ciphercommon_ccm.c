@@ -336,6 +336,10 @@ static int ccm_set_iv(PROV_CCM_CTX *ctx, size_t mlen)
     if (!hw->setiv(ctx, ctx->iv, ccm_get_ivlen(ctx), mlen))
         return 0;
     ctx->len_set = 1;
+    /* a new message starts here: no AAD yet, and no tag when encrypting */
+    ctx->aad_set = 0;
+    if (ctx->enc)
+        ctx->tag_set = 0;
     return 1;
 }
 
@@ -412,12 +416,25 @@ static int ccm_cipher_internal(PROV_CCM_CTX *ctx, unsigned char *out,
         if (in == NULL) {
             if (!ccm_set_iv(ctx, len))
                 goto err;
-        } else {
+        } else if (len > 0) {
             /* If we have AAD, we need a message length */
-            if (!ctx->len_set && len)
+            if (!ctx->len_set)
                 goto err;
+            /*
+             * CRYPTO_ccm128_aad() formats the AAD length into the first
+             * CBC-MAC block after B_0 (SP 800-38C, A.2.2) and restarts the
+             * MAC from E(B_0), so it must see the whole AAD in one call: a
+             * second call silently discards everything hashed by the first
+             * one. Once the payload has been encrypted the tag is fixed and
+             * AAD can no longer be absorbed either.
+             */
+            if (ctx->aad_set || (ctx->enc && ctx->tag_set)) {
+                ERR_raise(ERR_LIB_PROV, PROV_R_UPDATE_CALL_OUT_OF_ORDER);
+                goto err;
+            }
             if (!hw->setaad(ctx, in, len))
                 goto err;
+            ctx->aad_set = 1;
         }
     } else {
         /* If not set length yet do it */
@@ -425,6 +442,17 @@ static int ccm_cipher_internal(PROV_CCM_CTX *ctx, unsigned char *out,
             goto err;
 
         if (ctx->enc) {
+            /*
+             * The payload is processed in one CRYPTO_ccm128_encrypt() call.
+             * A second call, including a zero-length one, re-runs the pass:
+             * the counter bytes of the nonce block were zeroed by the first
+             * pass so a zero length passes the length check, and another
+             * S_0 block is XORed into the CBC-MAC, corrupting the tag.
+             */
+            if (ctx->tag_set) {
+                ERR_raise(ERR_LIB_PROV, PROV_R_UPDATE_CALL_OUT_OF_ORDER);
+                goto err;
+            }
             if (!hw->auth_encrypt(ctx, in, out, len, NULL, 0))
                 goto err;
             ctx->tag_set = 1;
@@ -458,6 +486,7 @@ void ossl_ccm_initctx(PROV_CCM_CTX *ctx, size_t keybits, const PROV_CCM_HW *hw)
     ctx->iv_set = 0;
     ctx->tag_set = 0;
     ctx->len_set = 0;
+    ctx->aad_set = 0;
     ctx->l = 8;
     ctx->m = 12;
     ctx->tls_aad_len = UNINITIALISED_SIZET;
