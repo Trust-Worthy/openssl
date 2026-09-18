@@ -305,8 +305,10 @@ static int chacha20_poly1305_update(void *vctx, unsigned char *out,
 {
     PROV_CHACHA20_POLY1305_CTX *ctx = (PROV_CHACHA20_POLY1305_CTX *)vctx;
 
-    if (ctx->iv_state == IV_STATE_FINISHED)
+    if (ctx->iv_state == IV_STATE_FINISHED) {
+        ERR_raise(ERR_LIB_PROV, PROV_R_UPDATE_CALL_OUT_OF_ORDER);
         return 0;
+    }
 
     /*
      * a zero-length update is a nop, ALWAYS SUCCEED via early exit
@@ -328,6 +330,12 @@ static int chacha20_poly1305_final(void *vctx, unsigned char *out, size_t *outl,
 
     if (!ossl_prov_is_running())
         return 0;
+
+    /* A second Final must not replace the tag. */
+    if (ctx->iv_state == IV_STATE_FINISHED) {
+        ERR_raise(ERR_LIB_PROV, PROV_R_UPDATE_CALL_OUT_OF_ORDER);
+        return 0;
+    }
 
     /* The tag must be set before actually decrypting data */
     if (!ctx->base.enc && ctx->tag_len == 0) {
