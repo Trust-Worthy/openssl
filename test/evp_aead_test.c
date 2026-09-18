@@ -365,12 +365,12 @@ err:
 }
 
 /*
- * Total plaintext length for the chunked-vs-oneshot equivalence test.
- * Deliberately not a multiple of any target algorithm's internal
- * block/keystream size (AES: 16, ChaCha20-Poly1305: 64), so every stride
- * in [1, CHUNKED_EQUIV_LEN - 1] produces at least one non-aligned chunk
- * boundary somewhere in its split.
- */
+* Total plaintext length for the chunked-vs-oneshot equivalence test.
+* Deliberately not a multiple of any target algorithm's internal
+* block/keystream size (AES: 16, ChaCha20-Poly1305: 64), so every stride
+* in [1, CHUNKED_EQUIV_LEN - 1] produces at least one non-aligned chunk
+* boundary somewhere in its split.
+*/
 #define CHUNKED_EQUIV_LEN 133
 
 /*-
@@ -448,7 +448,7 @@ static int test_evp_aead_chunked_oneshot_equiv(int idx)
                  "multi-call Update()", stride, info->name);
          return 1;
      }
-     
+
     EVP_CIPHER_CTX *ctx_oneshot = NULL;
     EVP_CIPHER_CTX *ctx_stream = NULL;
 
