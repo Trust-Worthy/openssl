@@ -364,12 +364,231 @@ err:
     return testresult;
 }
 
+/*
+ * Total plaintext length for the chunked-vs-oneshot equivalence test.
+ * Deliberately not a multiple of any target algorithm's internal
+ * block/keystream size (AES: 16, ChaCha20-Poly1305: 64), so every stride
+ * in [1, CHUNKED_EQUIV_LEN - 1] produces at least one non-aligned chunk
+ * boundary somewhere in its split.
+ */
+#define CHUNKED_EQUIV_LEN 133
+
+/*-
+ * A nonzero-length AEAD plaintext, encrypted via a single full-length
+ * EVP_EncryptUpdate() call, must produce byte-identical ciphertext and tag
+ * to the same plaintext encrypted via EVP_EncryptUpdate() split across an
+ * arbitrary sequence of chunk sizes ("stride"). This generalizes
+ * test_evp_oneshot_aead_zerolen's one-shot/streaming comparison from the
+ * zero-length boundary to every chunk-boundary alignment -- exactly the
+ * class of buffering/carry-state bug that a single full-length call, or a
+ * single chunked call, structurally cannot exercise on its own: a
+ * block-cipher-based AEAD mode must carry partial-block state *inside the
+ * EVP_CIPHER_CTX* between Update() calls, and that logic is invisible to
+ * fixed-vector KATs, which are always driven through a single Update().
+ *
+ * Both the "one-shot" and streaming legs go through EVP_EncryptUpdate() +
+ * EVP_EncryptFinal_ex() -- the only difference is call count -- so the
+ * comparison isolates chunk-boundary alignment as the sole variable.
+ * EVP_Cipher() is deliberately NOT used for the one-shot leg: for
+ * nonzero-length AEAD input it does not finalize the tag the same way
+ * EVP_EncryptFinal_ex() does, which produced an all-zero reference tag and
+ * a spurious mismatch on every algorithm/stride pair when first tried.
+ *
+ * idx decomposes into (alg_idx, stride): for every AEAD algorithm in
+ * aead_list, every stride from 1 to CHUNKED_EQUIV_LEN - 1 is tried, with
+ * the final chunk absorbing whatever remainder doesn't divide evenly --
+ * modeled on the stride-loop in xof_absorb_test() rather than a hand-listed
+ * pattern table, so it needs no maintenance if CHUNKED_EQUIV_LEN changes.
+ *
+ * For CCM, EVP_CipherUpdate() requires the total plaintext length to be
+ * declared up front, before any payload bytes arrive, via a single
+ * NULL-data Update call carrying only the length -- done once per context
+ * below, with the *total* CHUNKED_EQUIV_LEN, not per-chunk. AAD is
+ * deliberately skipped here; AAD-chunking equivalence is scoped as a
+ * follow-up.
+ */
+static int test_evp_aead_chunked_oneshot_equiv(int idx)
+{
+    const int n_strides = CHUNKED_EQUIV_LEN - 1;
+    const int alg_idx = idx / n_strides;
+    const size_t stride = (size_t)(idx % n_strides) + 1;
+    const AEAD_DATA *info = &aead_list[alg_idx];
+
+    if (info->mode == EVP_CIPH_SIV_MODE
+        || info->mode == EVP_CIPH_GCM_SIV_MODE) {
+        TEST_info("skipping stride=%zu for %s: SIV requires single-call payload",
+                stride, info->name);
+        return 1;
+    }
+
+    if (info->mode == EVP_CIPH_OCB_MODE
+        && (stride % (size_t)EVP_CIPHER_get_block_size(info->ciph)) != 0) {
+        TEST_info("skipping stride=%zu for %s: OCB requires block-aligned "
+                "intermediate Update() calls (EVP_EncryptInit.pod, "
+                "\"Cipher operations\" section)", stride, info->name);
+        return 1;
+    }
+    
+
+    /*
+    * CCM's generic fallback path (used whenever no bulk/hardware
+    * ctx->str implementation is active for the cipher on this platform)
+    * hard-requires the full declared length in a single Update() call
+    * and rejects any chunked split -- confirmed under LLDB for every
+    * CCM cipher in aead_list on this build (AES-*-CCM, SM4-CCM,
+    * ARIA-*-CCM all have ctx->str == NULL here). This is a property of
+    * the fallback path itself, not any one cipher, so the whole mode is
+    * skipped rather than naming individual ciphers. See
+    * <tracking-doc-filename>.md for the follow-up PR outline.
+    */
+
+    if (info->mode == EVP_CIPH_CCM_MODE) {
+        TEST_info("skipping stride=%zu for %s: generic CCM fallback (no "
+                  "bulk ctx->str on this build/platform) rejects "
+                 "multi-call Update()", stride, info->name);
+         return 1;
+     }
+     
+    EVP_CIPHER_CTX *ctx_oneshot = NULL;
+    EVP_CIPHER_CTX *ctx_stream = NULL;
+
+    unsigned char key[EVP_MAX_KEY_LENGTH] = { 0 };
+    unsigned char iv[EVP_MAX_IV_LENGTH] = { 0 };
+    unsigned char pt[CHUNKED_EQUIV_LEN] = { 0 };
+
+    unsigned char ct_oneshot[CHUNKED_EQUIV_LEN] = { 0 };
+    unsigned char ct_stream[CHUNKED_EQUIV_LEN] = { 0 };
+
+    unsigned char tag_oneshot[EVPTEST_TAG_LEN_MAX] = { 0 };
+    unsigned char tag_stream[EVPTEST_TAG_LEN_MAX] = { 0 };
+
+    OSSL_PARAM get_tagparams[2];
+    int taglen = info->taglen;
+    int i = 0, outl = 0, outl2 = 0, ccm_declare_outlen = 0;
+    int oneshot_total = 0, stream_total = 0, testresult = 0;
+
+    TEST_info("test_evp_aead_chunked_oneshot_equiv: alg=%s stride=%zu",
+              info->name, stride);
+        
+    
+    for (i = 0; i < info->keylen; i++)
+        key[i] = (unsigned char)(0xA0 + i);
+    for (i = 0; i < info->ivlen; i++)
+        iv[i] = (unsigned char)(0xB0 + i);
+    for (i = 0; i < CHUNKED_EQUIV_LEN; i++)
+        pt[i] = (unsigned char)(0xC0 + (i % 0x40));
+
+    /* --- "one-shot" path: reference, single full-length Update --- */
+    if (!TEST_ptr(ctx_oneshot = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_oneshot, info->ciph, key, iv, NULL))) {
+        TEST_info("one-shot init failed: alg=%s stride=%zu", info->name, stride);
+        goto err;
+    }
+
+    if (info->mode == EVP_CIPH_CCM_MODE
+        && !TEST_true(EVP_CipherUpdate(ctx_oneshot, NULL, &ccm_declare_outlen,
+                                        NULL, CHUNKED_EQUIV_LEN) > 0)) {
+        TEST_info("one-shot CCM length declare failed: alg=%s stride=%zu",
+                  info->name, stride);
+        goto err;
+    }
+
+    if (!TEST_true(EVP_EncryptUpdate(ctx_oneshot, ct_oneshot, &outl, pt,
+                                      CHUNKED_EQUIV_LEN))) {
+        TEST_info("one-shot update failed: alg=%s stride=%zu", info->name, stride);
+        goto err;
+    }
+    oneshot_total = outl;
+
+    if (!TEST_true(EVP_EncryptFinal_ex(ctx_oneshot, ct_oneshot + oneshot_total,
+                                        &outl2))) {
+        TEST_info("one-shot final failed: alg=%s stride=%zu", info->name, stride);
+        goto err;
+    }
+    oneshot_total += outl2;
+
+    i = EVP_CIPHER_CTX_get_tag_length(ctx_oneshot);
+    if (i > 0)
+        taglen = i;
+    if (!TEST_int_le(taglen, EVPTEST_TAG_LEN_MAX))
+        goto err;
+
+    get_tagparams[0] = OSSL_PARAM_construct_octet_string(
+        OSSL_CIPHER_PARAM_AEAD_TAG, tag_oneshot, taglen);
+    get_tagparams[1] = OSSL_PARAM_construct_end();
+    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx_oneshot, get_tagparams))) {
+        TEST_info("one-shot get tag failed: alg=%s stride=%zu", info->name, stride);
+        goto err;
+    }
+
+    /* --- streaming path: split into `stride`-sized Update() calls --- */
+    if (!TEST_ptr(ctx_stream = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_stream, info->ciph, key, iv, NULL))) {
+        TEST_info("stream init failed: alg=%s stride=%zu", info->name, stride);
+        goto err;
+    }
+
+    if (info->mode == EVP_CIPH_CCM_MODE
+        && !TEST_true(EVP_CipherUpdate(ctx_stream, NULL, &ccm_declare_outlen,
+                                        NULL, CHUNKED_EQUIV_LEN) > 0)) {
+        TEST_info("stream CCM length declare failed: alg=%s stride=%zu",
+                  info->name, stride);
+        goto err;
+    }
+
+    {
+        size_t off, sz;
+
+        for (off = 0; off < CHUNKED_EQUIV_LEN; off += sz) {
+            sz = stride;
+            if (off + sz > CHUNKED_EQUIV_LEN)
+                sz = CHUNKED_EQUIV_LEN - off;
+            if (!TEST_true(EVP_EncryptUpdate(ctx_stream, ct_stream + off, &outl,
+                                              pt + off, (int)sz))) {
+                TEST_info("stream update failed: alg=%s stride=%zu off=%zu",
+                          info->name, stride, off);
+                goto err;
+            }
+            stream_total += outl;
+        }
+    }
+    if (!TEST_true(EVP_EncryptFinal_ex(ctx_stream, ct_stream + stream_total,
+                                        &outl))) {
+        TEST_info("stream final failed: alg=%s stride=%zu", info->name, stride);
+        goto err;
+    }
+    stream_total += outl;
+
+    get_tagparams[0] = OSSL_PARAM_construct_octet_string(
+        OSSL_CIPHER_PARAM_AEAD_TAG, tag_stream, taglen);
+    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx_stream, get_tagparams))) {
+        TEST_info("stream get tag failed: alg=%s stride=%zu", info->name, stride);
+        goto err;
+    }
+
+    /* --- the actual assertion --- */
+    if (!TEST_int_eq(oneshot_total, CHUNKED_EQUIV_LEN)
+        || !TEST_int_eq(stream_total, CHUNKED_EQUIV_LEN)
+        || !TEST_mem_eq(ct_oneshot, CHUNKED_EQUIV_LEN, ct_stream, CHUNKED_EQUIV_LEN)
+        || !TEST_mem_eq(tag_oneshot, taglen, tag_stream, taglen)) {
+        TEST_info("mismatch: alg=%s stride=%zu", info->name, stride);
+        goto err;
+    }
+
+    testresult = 1;
+err:
+    EVP_CIPHER_CTX_free(ctx_oneshot);
+    EVP_CIPHER_CTX_free(ctx_stream);
+    return testresult;
+}
+
 int setup_tests(void)
 {
     if (!setup_aead_list())
         return 0;
 
     ADD_ALL_TESTS(test_evp_oneshot_aead_zerolen, aead_list_n);
+    ADD_ALL_TESTS(test_evp_aead_chunked_oneshot_equiv,aead_list_n * (CHUNKED_EQUIV_LEN - 1));
     return 1;
 }
 
