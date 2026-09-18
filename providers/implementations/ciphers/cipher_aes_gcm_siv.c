@@ -135,7 +135,21 @@ static int ossl_aes_gcm_siv_dinit(void *vctx, const unsigned char *key, size_t k
     return ossl_aes_gcm_siv_init(vctx, key, keylen, iv, ivlen, params, 0);
 }
 
-#define ossl_aes_gcm_siv_stream_update ossl_aes_gcm_siv_cipher
+static int ossl_aes_gcm_siv_cipher(void *vctx, unsigned char *out, size_t *outl,
+    size_t outsize, const unsigned char *in, size_t inl);
+
+static int ossl_aes_gcm_siv_stream_update(void *vctx, unsigned char *out,
+    size_t *outl, size_t outsize,
+    const unsigned char *in, size_t inl)
+{
+    /* A zero-length payload update is a no-op. */
+    if (inl == 0) {
+        *outl = 0;
+        return 1;
+    }
+    return ossl_aes_gcm_siv_cipher(vctx, out, outl, outsize, in, inl);
+}
+
 static int ossl_aes_gcm_siv_cipher(void *vctx, unsigned char *out, size_t *outl,
     size_t outsize, const unsigned char *in, size_t inl)
 {

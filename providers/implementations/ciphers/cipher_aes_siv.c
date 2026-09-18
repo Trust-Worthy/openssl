@@ -23,7 +23,21 @@
 #include "prov/provider_ctx.h"
 #include "providers/implementations/ciphers/cipher_aes_siv.inc"
 
-#define siv_stream_update siv_cipher
+static OSSL_FUNC_cipher_cipher_fn siv_cipher;
+
+static int siv_stream_update(void *vctx, unsigned char *out, size_t *outl,
+    size_t outsize, const unsigned char *in, size_t inl)
+{
+    /*
+     * A zero-length payload update is a no-op. An empty AAD update still
+     * counts, as the test vectors require.
+     */
+    if (inl == 0 && out != NULL) {
+        *outl = 0;
+        return 1;
+    }
+    return siv_cipher(vctx, out, outl, outsize, in, inl);
+}
 #define SIV_FLAGS AEAD_FLAGS
 
 static OSSL_FUNC_cipher_set_ctx_params_fn aes_siv_set_ctx_params;
