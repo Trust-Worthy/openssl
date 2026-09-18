@@ -135,7 +135,29 @@ static int ossl_aes_gcm_siv_dinit(void *vctx, const unsigned char *key, size_t k
     return ossl_aes_gcm_siv_init(vctx, key, keylen, iv, ivlen, params, 0);
 }
 
-#define ossl_aes_gcm_siv_stream_update ossl_aes_gcm_siv_cipher
+static int ossl_aes_gcm_siv_cipher(void *vctx, unsigned char *out, size_t *outl,
+    size_t outsize, const unsigned char *in, size_t inl);
+
+static int ossl_aes_gcm_siv_stream_update(void *vctx, unsigned char *out,
+    size_t *outl, size_t outsize,
+    const unsigned char *in, size_t inl)
+{
+    /*
+     * The EVP layer forwards zero-length updates. GCM-SIV encrypts or
+     * decrypts the whole payload in one pass, after which the tag is fixed
+     * and no further payload is accepted, so an empty update must not be
+     * taken as that pass: the following update with the actual payload
+     * would be rejected as out of order, and the tag would be that of the
+     * empty message. The AEAD one-shot path (in == NULL) is the final and
+     * stays as is; an empty message is finalised there.
+     */
+    if (inl == 0) {
+        *outl = 0;
+        return 1;
+    }
+    return ossl_aes_gcm_siv_cipher(vctx, out, outl, outsize, in, inl);
+}
+
 static int ossl_aes_gcm_siv_cipher(void *vctx, unsigned char *out, size_t *outl,
     size_t outsize, const unsigned char *in, size_t inl)
 {

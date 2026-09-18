@@ -23,7 +23,27 @@
 #include "prov/provider_ctx.h"
 #include "providers/implementations/ciphers/cipher_aes_siv.inc"
 
-#define siv_stream_update siv_cipher
+static OSSL_FUNC_cipher_cipher_fn siv_cipher;
+
+static int siv_stream_update(void *vctx, unsigned char *out, size_t *outl,
+    size_t outsize, const unsigned char *in, size_t inl)
+{
+    /*
+     * The EVP layer forwards zero-length updates. SIV makes its single pass
+     * over the payload in one call, so an empty update must not be taken as
+     * that pass: the following update with the actual payload would be
+     * refused (ossl_siv128_encrypt() only runs once) and the tag would be
+     * that of the empty message. The AEAD one-shot path (in == NULL) is the
+     * final and stays as is; an empty message is finalised there.
+     * AAD updates (out == NULL) are left alone: RFC 5297 S2V takes a vector
+     * of strings, and an empty string is a distinct component.
+     */
+    if (inl == 0 && out != NULL) {
+        *outl = 0;
+        return 1;
+    }
+    return siv_cipher(vctx, out, outl, outsize, in, inl);
+}
 #define SIV_FLAGS AEAD_FLAGS
 
 static OSSL_FUNC_cipher_set_ctx_params_fn aes_siv_set_ctx_params;
