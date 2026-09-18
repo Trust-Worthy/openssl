@@ -102,6 +102,35 @@ int main(void)
 
     EVP_CIPHER_CTX_free(enc);
 
+    printf("\n=== Does DECRYPT accept the RFC's own known-good ciphertext+tag? ===\n");
+    {
+        EVP_CIPHER_CTX *d = EVP_CIPHER_CTX_new();
+        unsigned char out[32];
+        int ol = 0, tl = 0;
+        OSSL_PARAM s[2];
+        unsigned char tag_copy[16];
+
+        memcpy(tag_copy, expected_tag, 16);
+        s[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+                                                  tag_copy, 16);
+        s[1] = OSSL_PARAM_construct_end();
+
+        if (d != NULL
+            && EVP_DecryptInit_ex2(d, cipher, key, iv, NULL)
+            && EVP_DecryptUpdate(d, out, &ol, expected_ct, sizeof(expected_ct))
+            && EVP_CIPHER_CTX_set_params(d, s)
+            && EVP_DecryptFinal_ex(d, out + ol, &tl) > 0) {
+            ol += tl;
+            if ((size_t)ol == sizeof(pt) && memcmp(out, pt, sizeof(pt)) == 0)
+                printf("DECRYPT OF KNOWN-GOOD CIPHERTEXT: OK\n");
+            else
+                printf("DECRYPT OF KNOWN-GOOD CIPHERTEXT: WRONG PLAINTEXT RECOVERED\n");
+        } else {
+            printf("DECRYPT OF KNOWN-GOOD CIPHERTEXT: FAILED (tag rejected or a call failed)\n");
+        }
+        EVP_CIPHER_CTX_free(d);
+    }
+
     printf("\n=== Same real key/nonce as the KAT vector, varying length only ===\n");
     {
         unsigned char buf[64];
