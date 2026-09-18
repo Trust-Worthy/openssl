@@ -67,6 +67,26 @@ static size_t ccm_get_ivlen(PROV_CCM_CTX *ctx)
     return 15 - ctx->l;
 }
 
+/*
+ * The tag length M and the length-field size L are encoded into the flags
+ * byte of the CCM128_CONTEXT nonce block by CRYPTO_ccm128_init(), which the
+ * setkey() functions call with the values current at that time. A change
+ * made after the key has been set therefore has to be pushed down again,
+ * otherwise the low level context keeps formatting B_0 with, and sizing the
+ * tag by, the old values. The block count (the SP 800-38C limit on data
+ * processed under one key) is kept.
+ */
+static void ccm_update_ml(PROV_CCM_CTX *ctx)
+{
+    uint64_t blocks = ctx->ccm_ctx.blocks;
+
+    if (!ctx->key_set)
+        return;
+    CRYPTO_ccm128_init(&ctx->ccm_ctx, (unsigned int)ctx->m, (unsigned int)ctx->l,
+        ctx->ccm_ctx.key, ctx->ccm_ctx.block);
+    ctx->ccm_ctx.blocks = blocks;
+}
+
 const OSSL_PARAM *ossl_ccm_settable_ctx_params(
     ossl_unused void *cctx, ossl_unused void *provctx)
 {
@@ -100,7 +120,10 @@ int ossl_ccm_set_ctx_params(void *vctx, const OSSL_PARAM params[])
             memcpy(ctx->buf, p.tag->data, p.tag->data_size);
             ctx->tag_set = 1;
         }
-        ctx->m = p.tag->data_size;
+        if (ctx->m != p.tag->data_size) {
+            ctx->m = p.tag->data_size;
+            ccm_update_ml(ctx);
+        }
     }
 
     if (p.ivlen != NULL) {
@@ -116,6 +139,7 @@ int ossl_ccm_set_ctx_params(void *vctx, const OSSL_PARAM params[])
         if (ctx->l != ivlen) {
             ctx->l = ivlen;
             ctx->iv_set = 0;
+            ccm_update_ml(ctx);
         }
     }
 
