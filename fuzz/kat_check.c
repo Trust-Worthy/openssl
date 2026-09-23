@@ -1,20 +1,9 @@
 /*
- * Checks our exact EVP_CIPHER_fetch/EncryptInit/EncryptUpdate/EncryptFinal/
- * get_tag call sequence against a known-good RFC 8452 test vector already
- * present (and presumably passing) in
- * test/recipes/30-test_evp_data/evpciph_aes_gcm_siv.txt, lines 286-292.
- *
- * If this FAILS: our own reproducer/harness's *sequence of API calls* is
- * wrong somehow (missing a step evp_test.c does differently), independent
- * of key material.
- * If this PASSES (exact byte match) but the all-zero-key sweep still
- * fails: the bug is specific to degenerate (all-zero) key/nonce material,
- * not a general GCM-SIV break.
- *
- * Also runs a controlled follow-up: same real (non-degenerate) key/nonce
- * as the KAT vector, varying ONLY the plaintext length. This isolates
- * whether short-length failures are about length specifically, or were
- * actually about the all-zero key/nonce used in earlier testing.
+ * Tests whether AES-256-GCM-SIV decrypt requires evp_test.c's exact
+ * two-stage init sequence: Init(cipher only, no key/IV) -> SET_TAG via
+ * ctrl -> Init(key+IV, cipher=NULL) -> Update -> Final. This is NOT the
+ * same as "set tag before Update with a single Init call" -- the tag is
+ * set BEFORE the key/IV are even installed.
  *
  * Build:  cc -I include kat_check.c libcrypto.a -o kat_check
  * Run:    ./kat_check
@@ -34,6 +23,71 @@ static void print_hex(const char *label, const unsigned char *buf, size_t len)
     for (i = 0; i < len; i++)
         printf("%02x", buf[i]);
     printf("\n");
+}
+
+/*
+ * Decrypt using evp_test.c's exact two-stage init ordering:
+ *   1. Init with cipher type only (key=NULL, iv=NULL)
+ *   2. SET_TAG via EVP_CIPHER_CTX_ctrl
+ *   3. Second Init call (cipher=NULL) to install key+iv
+ *   4. set_padding(0)
+ *   5. Update(ciphertext)
+ *   6. Final
+ */
+static int decrypt_evptest_order(EVP_CIPHER *cipher,
+                                  const unsigned char *key,
+                                  const unsigned char *iv,
+                                  const unsigned char *ct, int ct_len,
+                                  const unsigned char *tag, size_t tag_len,
+                                  unsigned char *out, int *out_len,
+                                  const char *label)
+{
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int ol = 0, tl = 0;
+    int ok = 0;
+
+    if (ctx == NULL) {
+        printf("%-45s CTX ALLOC FAILED\n", label);
+        return 0;
+    }
+
+    /* Stage 1: cipher type only, no key/iv yet */
+    if (!EVP_CipherInit_ex2(ctx, cipher, NULL, NULL, 0 /* decrypt */, NULL)) {
+        printf("%-45s STAGE1 INIT FAILED\n", label);
+        goto done;
+    }
+
+    /* Set tag BEFORE key/iv are installed -- matches evp_test.c exactly */
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
+                             (int)tag_len, (void *)tag) <= 0) {
+        printf("%-45s SET_TAG (early) FAILED\n", label);
+        goto done;
+    }
+
+    /* Stage 2: install key + iv (cipher=NULL keeps the current cipher) */
+    if (!EVP_CipherInit_ex(ctx, NULL, NULL, key, iv, -1)) {
+        printf("%-45s STAGE2 INIT (key/iv) FAILED\n", label);
+        goto done;
+    }
+
+    EVP_CIPHER_CTX_set_padding(ctx, 0); /* matches evp_test.c */
+
+    if (!EVP_DecryptUpdate(ctx, out, &ol, ct, ct_len)) {
+        printf("%-45s DECRYPT UPDATE FAILED\n", label);
+        goto done;
+    }
+
+    if (EVP_DecryptFinal_ex(ctx, out + ol, &tl) <= 0) {
+        printf("%-45s FAIL: tag rejected\n", label);
+        goto done;
+    }
+    ol += tl;
+    *out_len = ol;
+    ok = 1;
+
+done:
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
 }
 
 int main(void)
@@ -61,137 +115,62 @@ int main(void)
     };
 
     EVP_CIPHER *cipher = EVP_CIPHER_fetch(NULL, "AES-256-GCM-SIV", NULL);
-    EVP_CIPHER_CTX *enc = EVP_CIPHER_CTX_new();
-    unsigned char ct[32], tag[16];
-    int ct_len = 0, tmplen = 0;
-    OSSL_PARAM gp[2];
-    int ct_ok, tag_ok;
+    unsigned char out[32];
+    int out_len = 0;
 
-    if (cipher == NULL || enc == NULL) {
-        printf("SETUP FAILED\n");
+    if (cipher == NULL) {
+        printf("CIPHER FETCH FAILED\n");
         return 1;
     }
 
-    if (!EVP_EncryptInit_ex2(enc, cipher, key, iv, NULL)) {
-        printf("ENCRYPT INIT FAILED\n");
-        return 1;
-    }
-    EVP_CIPHER_CTX_set_padding(enc, 0); /* matches evp_test.c's unconditional call */
-    if (!EVP_EncryptUpdate(enc, ct, &ct_len, pt, sizeof(pt))
-        || !EVP_EncryptFinal_ex(enc, ct + ct_len, &tmplen)) {
-        printf("ENCRYPT CALL FAILED (not even a wrong-answer -- a hard failure)\n");
-        return 1;
-    }
-    ct_len += tmplen;
-
-    gp[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
-                                               tag, sizeof(tag));
-    gp[1] = OSSL_PARAM_construct_end();
-    if (!EVP_CIPHER_CTX_get_params(enc, gp)) {
-        printf("GET_TAG FAILED\n");
-        return 1;
+    printf("=== Decrypt RFC known-good ciphertext, evp_test.c's exact init order ===\n");
+    if (decrypt_evptest_order(cipher, key, iv, expected_ct, sizeof(expected_ct),
+                               expected_tag, sizeof(expected_tag),
+                               out, &out_len, "KAT ciphertext")) {
+        if ((size_t)out_len == sizeof(pt) && memcmp(out, pt, sizeof(pt)) == 0)
+            printf("RESULT: OK -- correct plaintext recovered\n");
+        else
+            printf("RESULT: WRONG PLAINTEXT RECOVERED\n");
     }
 
-    ct_ok = (ct_len == (int)sizeof(expected_ct))
-            && memcmp(ct, expected_ct, sizeof(expected_ct)) == 0;
-    tag_ok = memcmp(tag, expected_tag, sizeof(expected_tag)) == 0;
-
-    print_hex("got ciphertext     ", ct, ct_len);
-    print_hex("expected ciphertext", expected_ct, sizeof(expected_ct));
-    print_hex("got tag            ", tag, sizeof(tag));
-    print_hex("expected tag       ", expected_tag, sizeof(expected_tag));
-
-    printf("\nCiphertext match: %s\n", ct_ok ? "YES" : "NO");
-    printf("Tag match:        %s\n", tag_ok ? "YES" : "NO");
-
-    EVP_CIPHER_CTX_free(enc);
-
-    printf("\n=== Does DECRYPT accept the RFC's own known-good ciphertext+tag? ===\n");
+    printf("\n=== Same ordering, real key/nonce, varying length (own encrypt+decrypt) ===\n");
     {
-        EVP_CIPHER_CTX *d = EVP_CIPHER_CTX_new();
-        unsigned char out[32];
-        int ol = 0, tl = 0, init_ok = 0;
-        OSSL_PARAM s[2];
-        unsigned char tag_copy[16];
-
-        memcpy(tag_copy, expected_tag, 16);
-        s[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
-                                                  tag_copy, 16);
-        s[1] = OSSL_PARAM_construct_end();
-
-        if (d != NULL) {
-            init_ok = EVP_DecryptInit_ex2(d, cipher, key, iv, NULL);
-            if (init_ok)
-                EVP_CIPHER_CTX_set_padding(d, 0); /* matches evp_test.c */
-        }
-
-        if (init_ok
-            && EVP_DecryptUpdate(d, out, &ol, expected_ct, sizeof(expected_ct))
-            && EVP_CIPHER_CTX_set_params(d, s)
-            && EVP_DecryptFinal_ex(d, out + ol, &tl) > 0) {
-            ol += tl;
-            if ((size_t)ol == sizeof(pt) && memcmp(out, pt, sizeof(pt)) == 0)
-                printf("DECRYPT OF KNOWN-GOOD CIPHERTEXT: OK\n");
-            else
-                printf("DECRYPT OF KNOWN-GOOD CIPHERTEXT: WRONG PLAINTEXT RECOVERED\n");
-        } else {
-            printf("DECRYPT OF KNOWN-GOOD CIPHERTEXT: FAILED (tag rejected or a call failed)\n");
-        }
-        EVP_CIPHER_CTX_free(d);
-    }
-
-    printf("\n=== Same real key/nonce as the KAT vector, varying length only ===\n");
-    {
-        unsigned char buf[64];
+        unsigned char buf[64], c[128], t[16];
         size_t lens[] = { 1, 2, 3, 8, 15, 16, 17, 32 };
         size_t i;
 
         memset(buf, 0x41, sizeof(buf));
         for (i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
             EVP_CIPHER_CTX *e = EVP_CIPHER_CTX_new();
-            EVP_CIPHER_CTX *d = EVP_CIPHER_CTX_new();
-            unsigned char c[128], out[128], t[16];
-            int cl = 0, ol = 0, tl = 0, enc_init_ok = 0, dec_init_ok = 0;
-            OSSL_PARAM g[2], s[2];
-            int pass = 0;
+            int cl = 0, tl = 0, pass = 0;
+            OSSL_PARAM g[2];
+            char label[45];
 
-            if (e != NULL) {
-                enc_init_ok = EVP_EncryptInit_ex2(e, cipher, key, iv, NULL);
-                if (enc_init_ok)
-                    EVP_CIPHER_CTX_set_padding(e, 0); /* matches evp_test.c */
-            }
+            snprintf(label, sizeof(label), "len=%zu", lens[i]);
 
-            if (enc_init_ok
+            if (e != NULL
+                && EVP_EncryptInit_ex2(e, cipher, key, iv, NULL)
                 && EVP_EncryptUpdate(e, c, &cl, buf, (int)lens[i])
                 && EVP_EncryptFinal_ex(e, c + cl, &tl)) {
                 cl += tl;
                 g[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG, t, 16);
                 g[1] = OSSL_PARAM_construct_end();
+                if (EVP_CIPHER_CTX_get_params(e, g)) {
+                    unsigned char dec_out[128];
+                    int dec_out_len = 0;
 
-                if (d != NULL) {
-                    dec_init_ok = EVP_DecryptInit_ex2(d, cipher, key, iv, NULL);
-                    if (dec_init_ok)
-                        EVP_CIPHER_CTX_set_padding(d, 0); /* matches evp_test.c */
-                }
-
-                if (EVP_CIPHER_CTX_get_params(e, g)
-                    && dec_init_ok
-                    && EVP_DecryptUpdate(d, out, &ol, c, cl)) {
-                    s[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG, t, 16);
-                    s[1] = OSSL_PARAM_construct_end();
-                    if (EVP_CIPHER_CTX_set_params(d, s)
-                        && EVP_DecryptFinal_ex(d, out + ol, &tl) > 0) {
-                        ol += tl;
-                        pass = ((size_t)ol == lens[i] && memcmp(out, buf, lens[i]) == 0);
+                    if (decrypt_evptest_order(cipher, key, iv, c, cl, t, 16,
+                                               dec_out, &dec_out_len, label)) {
+                        pass = ((size_t)dec_out_len == lens[i]
+                                && memcmp(dec_out, buf, lens[i]) == 0);
                     }
                 }
             }
-            printf("len=%-3zu %s\n", lens[i], pass ? "OK" : "FAIL");
+            printf("%-45s %s\n", label, pass ? "OK" : "FAIL");
             EVP_CIPHER_CTX_free(e);
-            EVP_CIPHER_CTX_free(d);
         }
     }
 
     EVP_CIPHER_free(cipher);
-    return (ct_ok && tag_ok) ? 0 : 1;
+    return 0;
 }

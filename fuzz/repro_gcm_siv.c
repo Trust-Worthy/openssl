@@ -249,6 +249,7 @@ int main(void)
     printf("=== Baseline: single whole-buffer Update, no chunking ===\n");
     round_trip(key1, nonce1, NULL, 0, "crash key/nonce, empty pt");
     round_trip(key2, nonce2, pt2, 1, "crash key/nonce, 1-byte pt");
+    round_trip(zero_key, zero_nonce, pt2, 1, "zero key/nonce, 1-byte pt, no chunking");
 
     printf("\n=== Actual crash shape: 6 empty Updates then 1 real Update ===\n");
     round_trip_chunked(key2, nonce2, pt2, 1, 6, 6,
