@@ -364,119 +364,83 @@ err:
     return testresult;
 }
 
-/*-
- * CCM's tag length M and length-field size L are baked into the low
- * level CBC-MAC context by CRYPTO_ccm128_init(), which the setkey()
- * functions call with whatever M and L are current at that time. Before
- * "CCM: apply tag length and L changes made after the key is set", a
- * non-default tag length set via EVP_CIPHER_CTX_set_params() after the
- * key -- the order CCM's own documentation describes ("the tag needs to
- * be set before passing in data to be decrypted, but it can be set
- * after passing additional authenticated data") -- was recorded in the
- * provider's ctx->m but never pushed down to the low level context, so
- * the low level code kept using the tag length baked in at setkey().
- *
- * On encrypt this meant every call up through EVP_EncryptFinal_ex()
- * reported success, but the caller's subsequently requested tag length
- * did not match what the low level context believed the tag length to
- * be, and EVP_CIPHER_CTX_get_params() failed to retrieve the tag, with
- * nothing on the error queue explaining why.
- *
- * This test drives CCM through the documented order with a non-default
- * (16-byte) tag length and confirms the tag can be fetched on encrypt
- * and the message round-trips correctly through decrypt.
+/*
+ * Setting a CCM tag length after the key, as documented, must take
+ * effect: the result must match setting it before the key.
  */
-static int test_ccm_tag_length_after_key(int idx)
+static int test_evp_aead_ccm_tag_length_after_key(int idx)
 {
     const AEAD_DATA *info = &aead_list[idx];
-    EVP_CIPHER_CTX *ctx_enc = NULL;
-    EVP_CIPHER_CTX *ctx_dec = NULL;
-
-    static const unsigned char pt[] = "CCM tag-length-after-key regression payload";
+    EVP_CIPHER_CTX *ctx_ref = NULL;
+    EVP_CIPHER_CTX *ctx = NULL;
+    static const unsigned char pt[] = "CCM tag length after key regression payload";
     unsigned char key[EVP_MAX_KEY_LENGTH] = { 0 };
     unsigned char iv[EVP_MAX_IV_LENGTH] = { 0 };
-    unsigned char ct[sizeof(pt) + EVPTEST_TAG_LEN_MAX] = { 0 };
-    unsigned char pt_out[sizeof(pt)] = { 0 };
-    unsigned char tag[EVPTEST_TAG_LEN_MAX] = { 0 };
-    OSSL_PARAM set_tagparams[2];
-    OSSL_PARAM get_tagparams[2];
-
-    /*
-     * CCM's compiled-in default (ossl_ccm_initctx) is 12; this must
-     * differ from that or a stale bake-in and the requested value would
-     * coincide and this test would pass whether or not the fix is
-     * present.
-     */
-    const size_t new_taglen = 16;
+    unsigned char ct_ref[sizeof(pt)] = { 0 };
+    unsigned char ct[sizeof(pt)] = { 0 };
+    unsigned char tag_ref[16] = { 0 };
+    unsigned char tag[16] = { 0 };
+    OSSL_PARAM params[2];
+    /* must differ from the CCM default of 12 */
+    const size_t taglen = sizeof(tag);
     const int ptlen = (int)sizeof(pt) - 1;
-    int i, outlen = 0, totallen;
+    int i, outlen = 0, testresult = 0;
 
-    /* This bug and its fix are CCM-specific. */
     if (info->mode != EVP_CIPH_CCM_MODE)
         return 1;
 
-    TEST_info("test_ccm_tag_length_after_key: idx=%d, cipher=%s",
-               idx, info->name);
-
-    for (i = 0; i < info->keylen; i++)
+    for (i = 0; i < info->keylen && i < (int)sizeof(key); i++)
         key[i] = (unsigned char)(0xC0 + i);
-    for (i = 0; i < info->ivlen; i++)
+    for (i = 0; i < info->ivlen && i < (int)sizeof(iv); i++)
         iv[i] = (unsigned char)(0xD0 + i);
 
-    /*
-     * Documented order: key, then tag length, then declare message
-     * length, then payload.
-     */
-    set_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
-                                                          NULL, new_taglen);
-    set_tagparams[1] = OSSL_PARAM_construct_end();
-    if (!TEST_ptr(ctx_enc = EVP_CIPHER_CTX_new())
-        || !TEST_true(EVP_EncryptInit_ex2(ctx_enc, info->ciph, key, iv, NULL))
-        || !TEST_true(EVP_CIPHER_CTX_set_params(ctx_enc, set_tagparams))
-        || !TEST_true(EVP_EncryptUpdate(ctx_enc, NULL, &outlen, NULL, ptlen))
-        || !TEST_true(EVP_EncryptUpdate(ctx_enc, ct, &outlen, pt, ptlen))) {
-        TEST_info("encrypt (documented order) failed: idx=%d cipher=%s",
-                   idx, info->name);
-        goto err;
-    }
-    totallen = outlen;
-    if (!TEST_true(EVP_EncryptFinal_ex(ctx_enc, ct + totallen, &outlen))) {
-        TEST_info("encrypt final (documented order) failed: idx=%d cipher=%s",
-                   idx, info->name);
+    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+                                                  NULL, taglen);
+    params[1] = OSSL_PARAM_construct_end();
+
+    /* Reference: tag length set before the key. */
+    if (!TEST_ptr(ctx_ref = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_ref, info->ciph, NULL, NULL, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_set_params(ctx_ref, params))
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_ref, NULL, key, iv, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx_ref, NULL, &outlen, NULL, ptlen))
+        || !TEST_true(EVP_EncryptUpdate(ctx_ref, ct_ref, &outlen, pt, ptlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx_ref, ct_ref + outlen, &outlen))) {
+        TEST_info("reference encrypt failed: idx=%d cipher=%s", idx, info->name);
         goto err;
     }
 
-    get_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
-                                                          tag, new_taglen);
-    get_tagparams[1] = OSSL_PARAM_construct_end();
-    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx_enc, get_tagparams))) {
-        TEST_info("get tag after documented-order encrypt failed: idx=%d"
-                  " cipher=%s", idx, info->name);
+    /* Documented order: tag length set after the key. */
+    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx, info->ciph, key, iv, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_set_params(ctx, params))
+        || !TEST_true(EVP_EncryptUpdate(ctx, NULL, &outlen, NULL, ptlen))
+        || !TEST_true(EVP_EncryptUpdate(ctx, ct, &outlen, pt, ptlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx, ct + outlen, &outlen))) {
+        TEST_info("encrypt with tag length after key failed: idx=%d cipher=%s",
+                  idx, info->name);
         goto err;
     }
 
-    /* Documented order on decrypt: key, then tag, then declare length, then payload. */
-    set_tagparams[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
-                                                          tag, new_taglen);
-    set_tagparams[1] = OSSL_PARAM_construct_end();
-    if (!TEST_ptr(ctx_dec = EVP_CIPHER_CTX_new())
-        || !TEST_true(EVP_DecryptInit_ex2(ctx_dec, info->ciph, key, iv, NULL))
-        || !TEST_true(EVP_CIPHER_CTX_set_params(ctx_dec, set_tagparams))
-        || !TEST_true(EVP_DecryptUpdate(ctx_dec, NULL, &outlen, NULL, ptlen))
-        || !TEST_true(EVP_DecryptUpdate(ctx_dec, pt_out, &outlen, ct, ptlen))
-        || !TEST_mem_eq(pt_out, ptlen, pt, ptlen)) {
-        TEST_info("decrypt (documented order) failed: idx=%d cipher=%s",
-                   idx, info->name);
+    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+                                                  tag_ref, taglen);
+    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx_ref, params)))
+        goto err;
+    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+                                                  tag, taglen);
+    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx, params))
+        || !TEST_mem_eq(ct, ptlen, ct_ref, ptlen)
+        || !TEST_mem_eq(tag, taglen, tag_ref, taglen)) {
+        TEST_info("tag length set after key not applied: idx=%d cipher=%s",
+                  idx, info->name);
         goto err;
     }
 
-    EVP_CIPHER_CTX_free(ctx_enc);
-    EVP_CIPHER_CTX_free(ctx_dec);
-    return 1;
+    testresult = 1;
 err:
-    EVP_CIPHER_CTX_free(ctx_enc);
-    EVP_CIPHER_CTX_free(ctx_dec);
-    return 0;
+    EVP_CIPHER_CTX_free(ctx_ref);
+    EVP_CIPHER_CTX_free(ctx);
+    return testresult;
 }
 
 int setup_tests(void)
@@ -485,7 +449,7 @@ int setup_tests(void)
         return 0;
 
     ADD_ALL_TESTS(test_evp_oneshot_aead_zerolen, aead_list_n);
-    ADD_ALL_TESTS(test_ccm_tag_length_after_key, aead_list_n);
+    ADD_ALL_TESTS(test_evp_aead_ccm_tag_length_after_key, aead_list_n);
     return 1;
 }
 
