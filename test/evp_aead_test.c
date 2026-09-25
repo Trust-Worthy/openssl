@@ -364,12 +364,100 @@ err:
     return testresult;
 }
 
+/*
+ * An empty payload Update() must not change the result: the ciphertext
+ * and tag must match encrypting the same payload without it.
+ */
+static int test_evp_aead_empty_payload_update(int idx)
+{
+    const AEAD_DATA *info = &aead_list[idx];
+    EVP_CIPHER_CTX *ctx_ref = NULL;
+    EVP_CIPHER_CTX *ctx_empty = NULL;
+    static const unsigned char pt[] = "AEAD empty payload update regression payload";
+    unsigned char key[EVP_MAX_KEY_LENGTH] = { 0 };
+    unsigned char iv[EVP_MAX_IV_LENGTH] = { 0 };
+    unsigned char ct_ref[sizeof(pt) + EVP_MAX_BLOCK_LENGTH] = { 0 };
+    unsigned char ct_empty[sizeof(pt) + EVP_MAX_BLOCK_LENGTH] = { 0 };
+    unsigned char tag_ref[EVPTEST_TAG_LEN_MAX] = { 0 };
+    unsigned char tag_empty[EVPTEST_TAG_LEN_MAX] = { 0 };
+    OSSL_PARAM params[2];
+    const int ptlen = (int)sizeof(pt) - 1;
+    int i, outlen = 0, len_ref = 0, len_empty = 0, taglen;
+    int testresult = 0;
+
+    /* CCM rejects a leading empty update by design. */
+    if (info->mode == EVP_CIPH_CCM_MODE)
+        return 1;
+
+    for (i = 0; i < info->keylen && i < (int)sizeof(key); i++)
+        key[i] = (unsigned char)(0xC0 + i);
+    for (i = 0; i < info->ivlen && i < (int)sizeof(iv); i++)
+        iv[i] = (unsigned char)(0xD0 + i);
+
+    /* Reference: payload in a single Update(). */
+    if (!TEST_ptr(ctx_ref = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_ref, info->ciph, key, iv, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx_ref, ct_ref, &len_ref, pt, ptlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx_ref, ct_ref + len_ref, &outlen))) {
+        TEST_info("reference encrypt failed: idx=%d cipher=%s", idx, info->name);
+        goto err;
+    }
+    len_ref += outlen;
+
+    /* Same payload, preceded by an empty Update(). */
+    if (!TEST_ptr(ctx_empty = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_empty, info->ciph, key, iv, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx_empty, ct_empty, &outlen, pt, 0))) {
+        TEST_info("empty update rejected: idx=%d cipher=%s", idx, info->name);
+        goto err;
+    }
+    if (!TEST_true(EVP_EncryptUpdate(ctx_empty, ct_empty, &len_empty, pt, ptlen))) {
+        TEST_info("payload rejected after empty update: idx=%d cipher=%s",
+                  idx, info->name);
+        goto err;
+    }
+    if (!TEST_true(EVP_EncryptFinal_ex(ctx_empty, ct_empty + len_empty,
+                                       &outlen))) {
+        TEST_info("final failed after empty update: idx=%d cipher=%s",
+                  idx, info->name);
+        goto err;
+    }
+    len_empty += outlen;
+
+    taglen = EVP_CIPHER_CTX_get_tag_length(ctx_ref);
+    if (taglen <= 0)
+        taglen = info->taglen;
+    if (!TEST_int_le(taglen, EVPTEST_TAG_LEN_MAX))
+        goto err;
+    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+                                                  tag_ref, taglen);
+    params[1] = OSSL_PARAM_construct_end();
+    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx_ref, params)))
+        goto err;
+    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+                                                  tag_empty, taglen);
+    if (!TEST_true(EVP_CIPHER_CTX_get_params(ctx_empty, params))
+        || !TEST_mem_eq(ct_ref, len_ref, ct_empty, len_empty)
+        || !TEST_mem_eq(tag_ref, taglen, tag_empty, taglen)) {
+        TEST_info("empty update changed the result: idx=%d cipher=%s",
+                  idx, info->name);
+        goto err;
+    }
+
+    testresult = 1;
+err:
+    EVP_CIPHER_CTX_free(ctx_ref);
+    EVP_CIPHER_CTX_free(ctx_empty);
+    return testresult;
+}
+
 int setup_tests(void)
 {
     if (!setup_aead_list())
         return 0;
 
     ADD_ALL_TESTS(test_evp_oneshot_aead_zerolen, aead_list_n);
+    ADD_ALL_TESTS(test_evp_aead_empty_payload_update, aead_list_n);
     return 1;
 }
 
