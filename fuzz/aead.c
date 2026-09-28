@@ -94,7 +94,7 @@ typedef struct {
     char name[NAME_LEN];
     enum prof prof;
     size_t keylen;
-    size_t ivlen;  /* default nonce length */
+    size_t ivlen; /* default nonce length */
     size_t taglen; /* default tag length */
     /* GCM and ChaCha20-Poly1305: body_pattern encrypted with no AAD */
     unsigned char *ct_stream;
@@ -828,9 +828,6 @@ static void run_sequence(const uint8_t *buf, size_t len)
         case OP_MSGLEN:
             /* Declares the payload length for CCM; other modes do not use it */
             if (st != ST_ACTIVE)
-                break;
-            /* Skipped for OCB until its handling of a NULL input is fixed */
-            if (p.prof == P_OCB)
                 break;
             amt = clamp(want, SEQ_MAX);
             if (!EVP_CipherUpdate(ctx, NULL, &outl, NULL, (int)amt)) {
