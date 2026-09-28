@@ -9,7 +9,7 @@
 -}
 
 IF[{- !$disabled{"fuzz-afl"} || !$disabled{"fuzz-libfuzzer"} -}]
-  PROGRAMS{noinst}=asn1 asn1parse bignum aead_gcm_siv aead_claude_fuzzer aead_grok_fuzzer bndiv client conf crl server smime
+  PROGRAMS{noinst}=asn1 asn1parse bignum aead_gcm_siv aead_claude_fuzzer bndiv client conf crl server smime
   PROGRAMS{noinst}=pkcs7_verify
   PROGRAMS{noinst}=pkcs12 punycode pem decoder hashtable acert
   PROGRAMS{noinst}=v3name x509v3
@@ -74,10 +74,6 @@ IF[{- !$disabled{"fuzz-afl"} || !$disabled{"fuzz-libfuzzer"} -}]
   SOURCE[aead_claude_fuzzer]=aead_claude_fuzzer.c driver.c
   INCLUDE[aead_claude_fuzzer]=../include {- $ex_inc -}
   DEPEND[aead_claude_fuzzer]=../libcrypto {- $ex_lib -}  
-
-  SOURCE[aead_grok_fuzzer]=aead_grok_fuzzer.c driver.c
-  INCLUDE[aead_grok_fuzzer]=../include {- $ex_inc -}
-  DEPEND[aead_grok_fuzzer]=../libcrypto {- $ex_lib -}  
 
   SOURCE[bndiv]=bndiv.c driver.c
   INCLUDE[bndiv]=../include {- $ex_inc -}
