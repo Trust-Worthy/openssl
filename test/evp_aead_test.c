@@ -453,6 +453,83 @@ err:
     return testresult;
 }
 
+/*
+ * A second Final() on a finished context must not change the tag.
+ */
+static int test_evp_aead_double_final(int idx)
+{
+    const AEAD_DATA *info = &aead_list[idx];
+    EVP_CIPHER_CTX *ctx_ref = NULL;
+    EVP_CIPHER_CTX *ctx = NULL;
+    static const unsigned char pt[] = "AEAD double final regression payload";
+    unsigned char key[EVP_MAX_KEY_LENGTH] = { 0 };
+    unsigned char iv[EVP_MAX_IV_LENGTH] = { 0 };
+    unsigned char ct_ref[sizeof(pt) + EVP_MAX_BLOCK_LENGTH] = { 0 };
+    unsigned char ct[sizeof(pt) + EVP_MAX_BLOCK_LENGTH] = { 0 };
+    unsigned char tag_ref[EVPTEST_TAG_LEN_MAX] = { 0 };
+    unsigned char tag[EVPTEST_TAG_LEN_MAX] = { 0 };
+    OSSL_PARAM params_ref[2];
+    OSSL_PARAM params[2];
+    const int ptlen = (int)sizeof(pt) - 1;
+    int i, outlen = 0, len_ref = 0, len = 0, taglen;
+    int testresult = 0;
+
+    for (i = 0; i < info->keylen && i < (int)sizeof(key); i++)
+        key[i] = (unsigned char)(0xC0 + i);
+    for (i = 0; i < info->ivlen && i < (int)sizeof(iv); i++)
+        iv[i] = (unsigned char)(0xD0 + i);
+
+    /* Reference: a single Final(). */
+    if (!TEST_ptr(ctx_ref = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_ref, info->ciph, key, iv, NULL))
+        || (info->mode == EVP_CIPH_CCM_MODE
+            && !TEST_true(EVP_EncryptUpdate(ctx_ref, NULL, &outlen, NULL, ptlen)))
+        || !TEST_true(EVP_EncryptUpdate(ctx_ref, ct_ref, &len_ref, pt, ptlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx_ref, ct_ref + len_ref, &outlen))) {
+        TEST_info("reference encrypt failed: idx=%d cipher=%s", idx, info->name);
+        goto err;
+    }
+
+    /* Same message, with a second Final(); its result is not checked. */
+    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx, info->ciph, key, iv, NULL))
+        || (info->mode == EVP_CIPH_CCM_MODE
+            && !TEST_true(EVP_EncryptUpdate(ctx, NULL, &outlen, NULL, ptlen)))
+        || !TEST_true(EVP_EncryptUpdate(ctx, ct, &len, pt, ptlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx, ct + len, &outlen))) {
+        TEST_info("encrypt failed: idx=%d cipher=%s", idx, info->name);
+        goto err;
+    }
+    (void)EVP_EncryptFinal_ex(ctx, ct + len, &outlen);
+
+    taglen = EVP_CIPHER_CTX_get_tag_length(ctx_ref);
+    if (taglen <= 0)
+        taglen = info->taglen;
+    params_ref[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag_ref, taglen);
+    params_ref[1] = OSSL_PARAM_construct_end();
+    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag, taglen);
+    params[1] = OSSL_PARAM_construct_end();
+
+    /* The second Final() must not change the tag. */
+    if (!TEST_int_le(taglen, EVPTEST_TAG_LEN_MAX)
+        || !TEST_true(EVP_CIPHER_CTX_get_params(ctx_ref, params_ref))
+        || !TEST_true(EVP_CIPHER_CTX_get_params(ctx, params))
+        || !TEST_mem_eq(tag, taglen, tag_ref, taglen)) {
+        TEST_info("second final changed the tag: idx=%d cipher=%s",
+            idx, info->name);
+        goto err;
+    }
+
+    testresult = 1;
+err:
+    ERR_clear_error();
+    EVP_CIPHER_CTX_free(ctx_ref);
+    EVP_CIPHER_CTX_free(ctx);
+    return testresult;
+}
+
 int setup_tests(void)
 {
     if (!setup_aead_list())
@@ -460,6 +537,7 @@ int setup_tests(void)
 
     ADD_ALL_TESTS(test_evp_oneshot_aead_zerolen, aead_list_n);
     ADD_ALL_TESTS(test_evp_aead_finished_ctx, aead_list_n);
+    ADD_ALL_TESTS(test_evp_aead_double_final, aead_list_n);
     return 1;
 }
 
