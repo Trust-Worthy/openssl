@@ -688,6 +688,161 @@ err:
     return testresult;
 }
 
+/*
+ * A tag length set after the key and nonce must either take effect or be
+ * rejected. CCM is the only mode that takes it then, and the result must
+ * match setting it before the key.
+ */
+static int test_evp_aead_tag_length_after_key(int idx)
+{
+    const AEAD_DATA *info = &aead_list[idx];
+    EVP_CIPHER_CTX *ctx_ref = NULL;
+    EVP_CIPHER_CTX *ctx = NULL;
+    static const unsigned char pt[] = "tag length after key payload";
+    unsigned char key[EVP_MAX_KEY_LENGTH] = { 0 };
+    unsigned char iv[EVP_MAX_IV_LENGTH] = { 0 };
+    unsigned char ct_ref[sizeof(pt)] = { 0 };
+    unsigned char ct[sizeof(pt)] = { 0 };
+    /* differs from the default tag length of every mode */
+    unsigned char tag_ref[14] = { 0 };
+    unsigned char tag[14] = { 0 };
+    OSSL_PARAM params_len[2], params_ref[2], params[2];
+    const size_t taglen = sizeof(tag);
+    const int ptlen = (int)sizeof(pt) - 1;
+    int i, outlen = 0, testresult = 0;
+
+    for (i = 0; i < info->keylen && i < (int)sizeof(key); i++)
+        key[i] = (unsigned char)(0xC0 + i);
+    for (i = 0; i < info->ivlen && i < (int)sizeof(iv); i++)
+        iv[i] = (unsigned char)(0xD0 + i);
+
+    params_len[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        NULL, taglen);
+    params_len[1] = OSSL_PARAM_construct_end();
+    params_ref[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag_ref, taglen);
+    params_ref[1] = OSSL_PARAM_construct_end();
+    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag, taglen);
+    params[1] = OSSL_PARAM_construct_end();
+
+    /*
+     * Only CCM takes a tag length after the nonce is set; the other modes'
+     * handling is inconsistent and is left to a separate change.
+     */
+    if (info->mode != EVP_CIPH_CCM_MODE)
+    return 1;
+
+    /* reference: tag length set before the key */
+    if (!TEST_ptr(ctx_ref = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_ref, info->ciph, NULL, NULL, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_set_params(ctx_ref, params_len))
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_ref, NULL, key, iv, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx_ref, NULL, &outlen, NULL, ptlen))
+        || !TEST_true(EVP_EncryptUpdate(ctx_ref, ct_ref, &outlen, pt, ptlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx_ref, ct_ref + outlen, &outlen))
+        || !TEST_true(EVP_CIPHER_CTX_get_params(ctx_ref, params_ref))) {
+        TEST_info("reference encrypt failed: idx=%d cipher=%s", idx, info->name);
+        goto err;
+    }
+
+    /* tag length set after the key and nonce */
+    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx, info->ciph, key, iv, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_set_params(ctx, params_len))
+        || !TEST_true(EVP_EncryptUpdate(ctx, NULL, &outlen, NULL, ptlen))
+        || !TEST_true(EVP_EncryptUpdate(ctx, ct, &outlen, pt, ptlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx, ct + outlen, &outlen))
+        || !TEST_true(EVP_CIPHER_CTX_get_params(ctx, params))
+        || !TEST_mem_eq(ct, ptlen, ct_ref, ptlen)
+        || !TEST_mem_eq(tag, taglen, tag_ref, taglen)) {
+        TEST_info("tag length after key not applied: idx=%d cipher=%s",
+            idx, info->name);
+        goto err;
+    }
+
+    testresult = 1;
+err:
+    ERR_clear_error();
+    EVP_CIPHER_CTX_free(ctx_ref);
+    EVP_CIPHER_CTX_free(ctx);
+    return testresult;
+}
+/*
+ * A CCM tag length or IV length change after the message length has been
+ * declared cannot take effect, so it must be rejected. Re-setting the same
+ * length is not a change and must still succeed.
+ */
+static int test_evp_aead_ccm_length_change_mid_message(int idx)
+{
+    const AEAD_DATA *info = &aead_list[idx];
+    EVP_CIPHER_CTX *ctx = NULL;
+    static const unsigned char aad[] = "aad";
+    unsigned char key[EVP_MAX_KEY_LENGTH] = { 0 };
+    unsigned char iv[EVP_MAX_IV_LENGTH] = { 0 };
+    OSSL_PARAM params_tag[2], params_same[2], params_iv[2];
+    /* 14 differs from the default tag length of 12 */
+    const size_t taglen = 14;
+    /* 12-byte IV gives L = 3, a real change from the default 7-byte/L=8 */
+    size_t ivlen = 12;
+    int outlen = 0, testresult = 0;
+
+    /* only CCM takes a tag or IV length change this late */
+    if (info->mode != EVP_CIPH_CCM_MODE)
+        return 1;
+
+    params_tag[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        NULL, taglen);
+    params_tag[1] = OSSL_PARAM_construct_end();
+    params_same[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        NULL, 12);
+    params_same[1] = OSSL_PARAM_construct_end();
+    params_iv[0] = OSSL_PARAM_construct_size_t(OSSL_CIPHER_PARAM_AEAD_IVLEN,
+        &ivlen);
+    params_iv[1] = OSSL_PARAM_construct_end();
+
+    /* a tag length change after the length is declared must be rejected */
+    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx, info->ciph, key, iv, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx, NULL, &outlen, NULL, 16))
+        || !TEST_true(EVP_EncryptUpdate(ctx, NULL, &outlen, aad,
+            (int)sizeof(aad) - 1))
+        || !TEST_false(EVP_CIPHER_CTX_set_params(ctx, params_tag))
+        || !TEST_err_r(ERR_LIB_PROV, PROV_R_INVALID_TAG_LENGTH)) {
+        TEST_info("tag length change not rejected: idx=%d cipher=%s",
+            idx, info->name);
+        goto err;
+    }
+
+    /* re-setting the current tag length is a no-op, not a change */
+    ERR_clear_error();
+    if (!TEST_true(EVP_CIPHER_CTX_set_params(ctx, params_same))) {
+        TEST_info("same tag length wrongly rejected: idx=%d cipher=%s",
+            idx, info->name);
+        goto err;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    ctx = NULL;
+
+    /* an IV length change after the length is declared must be rejected */
+    ERR_clear_error();
+    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx, info->ciph, key, iv, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx, NULL, &outlen, NULL, 16))
+        || !TEST_false(EVP_CIPHER_CTX_set_params(ctx, params_iv))
+        || !TEST_err_r(ERR_LIB_PROV, PROV_R_INVALID_IV_LENGTH)) {
+        TEST_info("iv length change not rejected: idx=%d cipher=%s",
+            idx, info->name);
+        goto err;
+    }
+
+    testresult = 1;
+err:
+    ERR_clear_error();
+    EVP_CIPHER_CTX_free(ctx);
+    return testresult;
+}
+
 int setup_tests(void)
 {
     int i = 0;
@@ -706,6 +861,8 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_evp_aead_late_aad, aead_list_n);
     ADD_ALL_TESTS(test_evp_aead_finished_ctx, aead_list_n);
     ADD_ALL_TESTS(test_evp_aead_get_tag_pairwise, aead_list_n);
+    ADD_ALL_TESTS(test_evp_aead_tag_length_after_key, aead_list_n);
+    ADD_ALL_TESTS(test_evp_aead_ccm_length_change_mid_message, aead_list_n);
     return 1;
 }
 
