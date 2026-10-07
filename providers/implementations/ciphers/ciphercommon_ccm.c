@@ -67,6 +67,21 @@ static size_t ccm_get_ivlen(PROV_CCM_CTX *ctx)
     return 15 - ctx->l;
 }
 
+/*
+ * M and L are written into the low-level context when the key is set, so a
+ * change after that must be pushed down again. The block count is kept.
+ */
+static void ccm_update_ml(PROV_CCM_CTX *ctx)
+{
+    uint64_t blocks = ctx->ccm_ctx.blocks;
+
+    if (!ctx->key_set)
+        return;
+    CRYPTO_ccm128_init(&ctx->ccm_ctx, (unsigned int)ctx->m, (unsigned int)ctx->l,
+        ctx->ccm_ctx.key, ctx->ccm_ctx.block);
+    ctx->ccm_ctx.blocks = blocks;
+}
+
 const OSSL_PARAM *ossl_ccm_settable_ctx_params(
     ossl_unused void *cctx, ossl_unused void *provctx)
 {
@@ -100,7 +115,14 @@ int ossl_ccm_set_ctx_params(void *vctx, const OSSL_PARAM params[])
             memcpy(ctx->buf, p.tag->data, p.tag->data_size);
             ctx->tag_set = 1;
         }
-        ctx->m = p.tag->data_size;
+        if (ctx->m != p.tag->data_size) {
+            if (ctx->len_set) {
+                ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_TAG_LENGTH);
+                return 0;
+            }
+            ctx->m = p.tag->data_size;
+            ccm_update_ml(ctx);
+        }
     }
 
     if (p.ivlen != NULL) {
@@ -114,8 +136,13 @@ int ossl_ccm_set_ctx_params(void *vctx, const OSSL_PARAM params[])
             return 0;
         }
         if (ctx->l != ivlen) {
+            if (ctx->len_set) {
+                ERR_raise(ERR_LIB_PROV, PROV_R_INVALID_IV_LENGTH);
+                return 0;
+            }
             ctx->l = ivlen;
             ctx->iv_set = 0;
+            ccm_update_ml(ctx);
         }
     }
 
