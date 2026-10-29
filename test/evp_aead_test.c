@@ -556,6 +556,55 @@ err:
 }
 
 /*
+ * For the modes whose nonce length can be set, a length out of range must be
+ * rejected, and the rejection reported the same way across those modes:
+ * ERR_LIB_PROV / PROV_R_INVALID_IV_LENGTH.
+ */
+static int test_evp_aead_invalid_ivlen(int idx)
+{
+    const AEAD_DATA *info = &aead_list[idx];
+    EVP_CIPHER_CTX *ctx = NULL;
+    OSSL_PARAM params[2];
+    size_t bad[2] = { 0, 0 }; /* just below and just above the valid range */
+    int i = 0, testresult = 0;
+
+    if (info->mode == EVP_CIPH_CCM_MODE) {
+        bad[0] = 6; /* CCM takes 7 to 13 bytes */
+        bad[1] = 14;
+    } else if (info->mode == EVP_CIPH_OCB_MODE) {
+        bad[0] = 0; /* OCB takes 1 to 15 bytes */
+        bad[1] = 16;
+    } else if (info->mode == EVP_CIPH_GCM_MODE) {
+        bad[0] = 0; /* GCM takes 1 to 128 bytes */
+        bad[1] = 129;
+    } else {
+        return 1;
+    }
+
+    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx, info->ciph, NULL, NULL, NULL)))
+        goto err;
+
+    for (i = 0; i < 2; i++) {
+        params[0] = OSSL_PARAM_construct_size_t(OSSL_CIPHER_PARAM_AEAD_IVLEN,
+            &bad[i]);
+        params[1] = OSSL_PARAM_construct_end();
+        ERR_clear_error();
+        if (!TEST_false(EVP_CIPHER_CTX_set_params(ctx, params))
+            || !TEST_err_r(ERR_LIB_PROV, PROV_R_INVALID_IV_LENGTH)) {
+            TEST_info("test_evp_aead_invalid_ivlen %s: length %zu", info->name,
+                bad[i]);
+            goto err;
+        }
+    }
+
+    testresult = 1;
+err:
+    EVP_CIPHER_CTX_free(ctx);
+    return testresult;
+}
+
+/*
  * After Final, a further Update on the same context must be rejected, both
  * encrypting and decrypting.
  *
@@ -1148,6 +1197,7 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_evp_aead_params, OSSL_NELEM(aead_list));
     ADD_ALL_TESTS(test_evp_oneshot_aead_zerolen, OSSL_NELEM(aead_list));
     ADD_ALL_TESTS(test_evp_aead_late_aad, OSSL_NELEM(aead_list));
+    ADD_ALL_TESTS(test_evp_aead_invalid_ivlen, OSSL_NELEM(aead_list));
     ADD_ALL_TESTS(test_evp_aead_finished_ctx, OSSL_NELEM(aead_list));
     ADD_ALL_TESTS(test_evp_aead_get_tag_pairwise, OSSL_NELEM(aead_list));
     ADD_ALL_TESTS(test_evp_final_no_tag, OSSL_NELEM(aead_list));
