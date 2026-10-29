@@ -7352,6 +7352,61 @@ end:
     return ret;
 }
 
+/*
+ * A context parameter request that names the same parameter twice must be
+ * rejected with ERR_LIB_PROV / PROV_R_REPEATED_PARAMETER, for every gettable
+ * and settable context parameter the cipher lists. The parameter lists come
+ * from the cipher itself, so new parameters are covered automatically.
+ */
+static int test_cipher_param_repeated(int idx)
+{
+    const EVP_CIPHER_TEST_INFO *info = &cipher_list[idx];
+    EVP_CIPHER_CTX *ctx = NULL;
+    const OSSL_PARAM *defs, *def;
+    OSSL_PARAM params[3];
+    unsigned char buf0[64], buf1[64];
+    int settable, rv, testresult = 0;
+
+    if (!TEST_ptr(ctx = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_CipherInit_ex2(ctx, info->ciph, NULL, NULL, 1, NULL))) {
+        TEST_info("test_cipher_param_repeated %s: init", info->name);
+        goto err;
+    }
+
+    for (settable = 0; settable <= 1; settable++) {
+        defs = settable ? EVP_CIPHER_settable_ctx_params(info->ciph)
+                        : EVP_CIPHER_gettable_ctx_params(info->ciph);
+        for (def = defs; def != NULL && def->key != NULL; def++) {
+            /* same name and type twice; the values are never read */
+            memset(buf0, 0, sizeof(buf0));
+            memset(buf1, 0, sizeof(buf1));
+            params[0] = *def;
+            params[0].data = buf0;
+            params[0].data_size = sizeof(buf0);
+            params[0].return_size = OSSL_PARAM_UNMODIFIED;
+            params[1] = params[0];
+            params[1].data = buf1;
+            params[2] = OSSL_PARAM_construct_end();
+
+            ERR_clear_error();
+            rv = settable ? EVP_CIPHER_CTX_set_params(ctx, params)
+                          : EVP_CIPHER_CTX_get_params(ctx, params);
+            if (!TEST_false(rv)
+                || !TEST_err_r(ERR_LIB_PROV, PROV_R_REPEATED_PARAMETER)) {
+                TEST_info("test_cipher_param_repeated %s: repeated %s \"%s\"",
+                    info->name, settable ? "set" : "get", def->key);
+                goto err;
+            }
+        }
+    }
+
+    testresult = 1;
+err:
+    ERR_clear_error();
+    EVP_CIPHER_CTX_free(ctx);
+    return testresult;
+}
+
 #if !defined(OPENSSL_NO_MULTIBLOCK)
 static int test_aes_cbc_hmac_sha_reject_multiblock_params(const OSSL_PARAM *params)
 {
@@ -9655,6 +9710,7 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_evp_decrypt_roundtrip_multistep, cipher_list_n);
     ADD_ALL_TESTS(test_evp_aead_tag_direction, cipher_list_n);
     ADD_ALL_TESTS(test_evp_aead_tag_reject, cipher_list_n);
+    ADD_ALL_TESTS(test_cipher_param_repeated, cipher_list_n);
 
     ADD_ALL_TESTS(test_evp_init_seq, OSSL_NELEM(evp_init_tests));
     ADD_ALL_TESTS(test_evp_reset, OSSL_NELEM(evp_reset_tests));
