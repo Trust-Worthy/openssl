@@ -1131,6 +1131,94 @@ err:
     return testresult;
 }
 
+/*
+ * AES-SIV checks the tag in the payload update, or at Final when there is
+ * no payload. A wrong tag must be rejected in both cases and reported as
+ * ERR_LIB_PROV / PROV_R_BAD_DECRYPT.
+ */
+static int test_evp_aead_siv_bad_tag(int idx)
+{
+    const AEAD_DATA *info = &aead_list[idx];
+    EVP_CIPHER_CTX *ctx_enc = NULL; /* with a payload */
+    EVP_CIPHER_CTX *ctx_dec = NULL;
+    EVP_CIPHER_CTX *ctx_enc0 = NULL; /* without a payload */
+    EVP_CIPHER_CTX *ctx_dec0 = NULL;
+    OSSL_PARAM params[2];
+    static const unsigned char aad[] = "siv bad tag";
+    static const unsigned char pt[] = "a payload";
+    unsigned char key[EVP_MAX_KEY_LENGTH] = { 0 };
+    unsigned char tag[16] = { 0 };
+    unsigned char ct[sizeof(pt) + EVP_MAX_BLOCK_LENGTH] = { 0 };
+    unsigned char out[sizeof(pt) + EVP_MAX_BLOCK_LENGTH] = { 0 };
+    const int aadlen = (int)sizeof(aad) - 1;
+    const int ptlen = (int)sizeof(pt) - 1;
+    int i = 0, outl = 0, ctlen = 0, testresult = 0;
+
+    if (info->mode != EVP_CIPH_SIV_MODE)
+        return 1;
+
+    for (i = 0; i < info->keylen && i < (int)sizeof(key); i++)
+        key[i] = (unsigned char)(0xA0 + i);
+
+    params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+        tag, sizeof(tag));
+    params[1] = OSSL_PARAM_construct_end();
+
+    /* with a payload: the tag is checked in the payload update */
+    if (!TEST_ptr(ctx_enc = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_enc, info->ciph, key, NULL, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx_enc, NULL, &outl, aad, aadlen))
+        || !TEST_true(EVP_EncryptUpdate(ctx_enc, ct, &ctlen, pt, ptlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx_enc, ct + ctlen, &outl))
+        || !TEST_true(EVP_CIPHER_CTX_get_params(ctx_enc, params))) {
+        TEST_info("test_evp_aead_siv_bad_tag %s: encrypt", info->name);
+        goto err;
+    }
+    tag[0] ^= 1;
+    ERR_clear_error();
+    if (!TEST_ptr(ctx_dec = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_DecryptInit_ex2(ctx_dec, info->ciph, key, NULL, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_set_params(ctx_dec, params))
+        || !TEST_true(EVP_DecryptUpdate(ctx_dec, NULL, &outl, aad, aadlen))
+        || !TEST_false(EVP_DecryptUpdate(ctx_dec, out, &outl, ct, ctlen))
+        || !TEST_err_r(ERR_LIB_PROV, PROV_R_BAD_DECRYPT)) {
+        TEST_info("test_evp_aead_siv_bad_tag %s: decrypt", info->name);
+        goto err;
+    }
+
+    /* without a payload: the tag is checked at Final */
+    if (!TEST_ptr(ctx_enc0 = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_EncryptInit_ex2(ctx_enc0, info->ciph, key, NULL, NULL))
+        || !TEST_true(EVP_EncryptUpdate(ctx_enc0, NULL, &outl, aad, aadlen))
+        || !TEST_true(EVP_EncryptFinal_ex(ctx_enc0, out, &outl))
+        || !TEST_true(EVP_CIPHER_CTX_get_params(ctx_enc0, params))) {
+        TEST_info("test_evp_aead_siv_bad_tag %s: encrypt, no payload",
+            info->name);
+        goto err;
+    }
+    tag[0] ^= 1;
+    ERR_clear_error();
+    if (!TEST_ptr(ctx_dec0 = EVP_CIPHER_CTX_new())
+        || !TEST_true(EVP_DecryptInit_ex2(ctx_dec0, info->ciph, key, NULL, NULL))
+        || !TEST_true(EVP_CIPHER_CTX_set_params(ctx_dec0, params))
+        || !TEST_true(EVP_DecryptUpdate(ctx_dec0, NULL, &outl, aad, aadlen))
+        || !TEST_false(EVP_DecryptFinal_ex(ctx_dec0, out, &outl))
+        || !TEST_err_r(ERR_LIB_PROV, PROV_R_BAD_DECRYPT)) {
+        TEST_info("test_evp_aead_siv_bad_tag %s: decrypt, no payload",
+            info->name);
+        goto err;
+    }
+
+    testresult = 1;
+err:
+    ERR_clear_error();
+    EVP_CIPHER_CTX_free(ctx_enc);
+    EVP_CIPHER_CTX_free(ctx_dec);
+    EVP_CIPHER_CTX_free(ctx_enc0);
+    EVP_CIPHER_CTX_free(ctx_dec0);
+    return testresult;
+}
+
 int setup_tests(void)
 {
     size_t i = 0;
@@ -1154,6 +1242,7 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_evp_aead_enc_retval, OSSL_NELEM(aead_list));
     ADD_ALL_TESTS(test_evp_aead_update_null_input, OSSL_NELEM(aead_list));
     ADD_ALL_TESTS(test_gcm_reinit, OSSL_NELEM(gcm_reinit_tests));
+    ADD_ALL_TESTS(test_evp_aead_siv_bad_tag, OSSL_NELEM(aead_list));
     return 1;
 }
 
